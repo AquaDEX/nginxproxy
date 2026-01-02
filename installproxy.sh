@@ -1,0 +1,552 @@
+#!/bin/bash
+
+##############################################################################
+# NGINX High-Performance Proxy Installation Script
+# For Ubuntu 20.04/22.04/24.04
+# Usage: echo "youremail@example.com your-domain.com" | sudo ./install-nginx-proxy.sh
+#    Or: sudo ./install-nginx-proxy.sh youremail@example.com your-domain.com
+##############################################################################
+
+set -e  # Exit on any error
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Logging functions
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+log_tip() {
+    echo -e "${BLUE}[TIP]${NC} $1"
+}
+
+# Check if running as root
+if [[ $EUID -ne 0 ]]; then
+   log_error "This script must be run as root (use sudo)"
+   exit 1
+fi
+
+# Get email and domain from arguments or stdin
+if [ $# -eq 2 ]; then
+    # From command line arguments
+    EMAIL="$1"
+    DOMAIN="$2"
+else
+    # From stdin
+    read EMAIL DOMAIN
+fi
+
+# Validate inputs
+if [[ -z "$EMAIL" ]]; then
+    log_error "Email is required!"
+    log_error "Usage: echo \"email@example.com domain.com\" | sudo $0"
+    log_error "   Or: sudo $0 email@example.com domain.com"
+    exit 1
+fi
+
+if [[ -z "$DOMAIN" ]]; then
+    log_error "Domain/IP is required!"
+    log_error "Usage: echo \"email@example.com domain.com\" | sudo $0"
+    log_error "   Or: sudo $0 email@example.com domain.com"
+    exit 1
+fi
+
+# Validate email format
+if ! [[ "$EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+    log_error "Invalid email format: $EMAIL"
+    exit 1
+fi
+
+log_info "Starting NGINX installation and configuration..."
+log_info "Email: $EMAIL"
+log_info "Domain/IP: $DOMAIN"
+
+##############################################################################
+# 1. Update System
+##############################################################################
+log_info "Updating system packages..."
+apt update -qq
+apt upgrade -y -qq
+
+##############################################################################
+# 2. Install NGINX
+##############################################################################
+log_info "Installing NGINX..."
+apt install -y nginx
+
+# Stop nginx for certbot
+systemctl stop nginx
+
+##############################################################################
+# 3. Check if Input is IP Address
+##############################################################################
+IS_IP=0
+if [[ $DOMAIN =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    IS_IP=1
+    ORIGINAL_IP="$DOMAIN"
+    log_warn "⚠️  Detected IP address: $DOMAIN"
+    log_warn "⚠️  Let's Encrypt does NOT support bare IP addresses!"
+    echo ""
+    log_tip "Options to get a trusted SSL certificate:"
+    echo "  1. Use a free DNS service like nip.io or sslip.io"
+    echo "     Example: $DOMAIN.nip.io or $DOMAIN.sslip.io"
+    echo "  2. Register a free domain (freenom.com, afraid.org)"
+    echo "  3. Use Cloudflare Tunnel (cloudflared) for free SSL"
+    echo ""
+    log_warn "Proceeding with SELF-SIGNED certificate (browsers will show warnings)"
+    echo ""
+    sleep 2
+fi
+
+##############################################################################
+# 4. Install Certbot (only if domain)
+##############################################################################
+if [ $IS_IP -eq 0 ]; then
+    log_info "Installing Certbot..."
+    apt install -y certbot python3-certbot-nginx
+fi
+
+##############################################################################
+# 5. Obtain SSL Certificate
+##############################################################################
+CERT_FAILED=0
+
+if [ $IS_IP -eq 1 ]; then
+    # IP Address - Use Self-Signed Certificate
+    log_info "Generating self-signed certificate for IP: $DOMAIN..."
+
+    mkdir -p /etc/nginx/ssl
+
+    # Create OpenSSL config for IP SAN
+    cat > /tmp/openssl-ip.cnf <<EOF
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+distinguished_name = dn
+req_extensions = req_ext
+x509_extensions = v3_ca
+
+[dn]
+C = US
+ST = State
+L = City
+O = Organization
+CN = $DOMAIN
+
+[req_ext]
+subjectAltName = @alt_names
+
+[v3_ca]
+subjectAltName = @alt_names
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+
+[alt_names]
+IP.1 = $DOMAIN
+DNS.1 = localhost
+EOF
+
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout /etc/nginx/ssl/selfsigned.key \
+        -out /etc/nginx/ssl/selfsigned.crt \
+        -config /tmp/openssl-ip.cnf 2>/dev/null
+
+    rm /tmp/openssl-ip.cnf
+
+    SSL_CERT="/etc/nginx/ssl/selfsigned.crt"
+    SSL_KEY="/etc/nginx/ssl/selfsigned.key"
+    CERT_FAILED=1
+
+    log_warn "✅ Self-signed certificate created"
+    log_warn "⚠️  Browsers will show security warnings!"
+
+else
+    # Domain Name - Use Let's Encrypt
+    log_info "Obtaining SSL certificate from Let's Encrypt for: $DOMAIN..."
+
+    certbot certonly --standalone \
+        --non-interactive \
+        --agree-tos \
+        --email "$EMAIL" \
+        -d "$DOMAIN" \
+        --preferred-challenges http 2>&1 | tee /tmp/certbot.log
+
+    if [ ${PIPESTATUS[0]} -ne 0 ]; then
+        log_error "Failed to obtain SSL certificate from Let's Encrypt"
+
+        # Check if it's a DNS issue
+        if grep -q "DNS problem" /tmp/certbot.log; then
+            log_error "DNS is not properly configured for $DOMAIN"
+            log_tip "Make sure your domain's A record points to this server's IP"
+        fi
+
+        log_warn "Falling back to self-signed certificate..."
+
+        mkdir -p /etc/nginx/ssl
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout /etc/nginx/ssl/selfsigned.key \
+            -out /etc/nginx/ssl/selfsigned.crt \
+            -subj "/CN=$DOMAIN" 2>/dev/null
+
+        SSL_CERT="/etc/nginx/ssl/selfsigned.crt"
+        SSL_KEY="/etc/nginx/ssl/selfsigned.key"
+        CERT_FAILED=1
+    else
+        SSL_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+        SSL_KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+        log_info "✅ Let's Encrypt SSL certificate obtained successfully!"
+    fi
+
+    rm -f /tmp/certbot.log
+fi
+
+##############################################################################
+# 6. Optimize System Limits
+##############################################################################
+log_info "Optimizing system limits..."
+
+# Increase file descriptor limits
+if ! grep -q "www-data soft nofile" /etc/security/limits.conf; then
+    cat >> /etc/security/limits.conf <<EOF
+* soft nofile 65535
+* hard nofile 65535
+www-data soft nofile 65535
+www-data hard nofile 65535
+EOF
+fi
+
+# Increase system-wide limits
+if ! grep -q "# NGINX Optimization" /etc/sysctl.conf; then
+    cat >> /etc/sysctl.conf <<EOF
+
+# NGINX Optimization
+net.core.somaxconn = 65535
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 30
+net.core.netdev_max_backlog = 65535
+EOF
+fi
+
+sysctl -p > /dev/null 2>&1
+
+##############################################################################
+# 7. Create NGINX Configuration
+##############################################################################
+log_info "Creating NGINX configuration..."
+
+cat > /etc/nginx/nginx.conf <<'EOF'
+user www-data;
+worker_processes auto; # Use all CPU cores
+worker_rlimit_nofile 65535; # Allow massive concurrent connections
+pid /run/nginx.pid;
+
+events {
+    use epoll; # Efficient Linux event polling
+    worker_connections 16384;
+    multi_accept on;
+}
+
+http {
+    # --- 1. OPTIMIZATION: DNS Caching ---
+    resolver 1.1.1.1 8.8.8.8 valid=30s;
+    resolver_timeout 5s;
+
+    # --- 2. OPTIMIZATION: Logs ---
+    access_log off;
+    error_log /var/log/nginx/error.log crit;
+
+    # --- 3. OPTIMIZATION: TCP Stack ---
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on; # Critical for low latency
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+
+    # MIME types
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # --- 4. MAPS ---
+    # Extract the target URL from the path
+    map $request_uri $target_uri {
+        ~^/(https?://.*)$ $1;
+        default "";
+    }
+
+    map $target_uri $target_host {
+        ~^https?://([^/]+) $1;
+        default "";
+    }
+
+    # --- 5. SSL Configuration (Global) ---
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384';
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    ssl_session_tickets off;
+
+    # --- 6. HTTP Server (Port 80) - Redirect to HTTPS ---
+    server {
+        listen 80 reuseport;
+        server_name _;
+
+        # Redirect all HTTP to HTTPS
+        return 301 https://$host$request_uri;
+    }
+
+    # --- 7. HTTPS Server (Port 443) ---
+    server {
+        listen 443 ssl http2 reuseport;
+        server_name _;
+
+        # SSL Certificate
+        ssl_certificate SSL_CERT_PATH;
+        ssl_certificate_key SSL_KEY_PATH;
+
+        # --- 8. OPTIMIZATION: Buffer & Body ---
+        client_max_body_size 10m;
+        client_body_buffer_size 128k;
+        proxy_buffering off;
+
+        location / {
+            if ($target_uri = "") {
+                return 400 "Missing target URL. Usage: https://your-domain/https://api.example.com/endpoint";
+            }
+
+            # --- 9. CORS (Optimized) ---
+            if ($request_method = 'OPTIONS') {
+                add_header 'Access-Control-Allow-Origin' '*' always;
+                add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, PUT, DELETE' always;
+                add_header 'Access-Control-Allow-Headers' '*' always;
+                add_header 'Access-Control-Max-Age' 1728000;
+                add_header 'Content-Type' 'text/plain; charset=utf-8';
+                add_header 'Content-Length' 0;
+                return 204;
+            }
+
+            add_header 'Access-Control-Allow-Origin' '*' always;
+            add_header Access-Control-Allow-Headers "Authorization, Content-Type" always;
+            add_header Access-Control-Expose-Headers "Content-Length, Date" always;
+
+            # --- 10. PROXY CONFIGURATION ---
+            proxy_pass $target_uri;
+
+            # SSL Optimization
+            proxy_ssl_server_name on;
+            proxy_ssl_name $target_host;
+            proxy_ssl_protocols TLSv1.2 TLSv1.3;
+            proxy_ssl_session_reuse on;
+
+            # Connection Handling
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+
+            # Headers
+            proxy_set_header Host $target_host;
+            proxy_set_header X-Forwarded-For "";
+            proxy_set_header X-Real-IP "";
+
+            # Hide original CORS headers
+            proxy_hide_header Access-Control-Allow-Origin;
+            proxy_hide_header Access-Control-Allow-Methods;
+            proxy_hide_header Access-Control-Allow-Headers;
+
+            # Timeouts
+            proxy_connect_timeout 10s;
+            proxy_send_timeout 30s;
+            proxy_read_timeout 30s;
+        }
+
+        # Health check endpoint
+        location /health {
+            access_log off;
+            return 200 "OK\n";
+            add_header Content-Type text/plain;
+        }
+    }
+}
+EOF
+
+# Replace SSL certificate paths
+sed -i "s|SSL_CERT_PATH|$SSL_CERT|g" /etc/nginx/nginx.conf
+sed -i "s|SSL_KEY_PATH|$SSL_KEY|g" /etc/nginx/nginx.conf
+
+##############################################################################
+# 8. Test Configuration
+##############################################################################
+log_info "Testing NGINX configuration..."
+nginx -t
+
+if [ $? -ne 0 ]; then
+    log_error "NGINX configuration test failed!"
+    exit 1
+fi
+
+##############################################################################
+# 9. Setup Certbot Auto-Renewal (only for Let's Encrypt)
+##############################################################################
+if [ $CERT_FAILED -eq 0 ]; then
+    log_info "Setting up SSL certificate auto-renewal..."
+
+    # Create renewal hook to reload nginx
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    cat > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh <<'EOFHOOK'
+#!/bin/bash
+systemctl reload nginx
+EOFHOOK
+
+    chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+
+    # Test renewal (suppress output)
+    certbot renew --dry-run > /dev/null 2>&1 || log_warn "Certbot renewal test had warnings"
+fi
+
+##############################################################################
+# 10. Configure Firewall (if UFW is installed)
+##############################################################################
+if command -v ufw &> /dev/null; then
+    log_info "Configuring firewall..."
+    ufw allow 80/tcp > /dev/null 2>&1
+    ufw allow 443/tcp > /dev/null 2>&1
+    ufw --force enable > /dev/null 2>&1
+fi
+
+##############################################################################
+# 11. Start NGINX
+##############################################################################
+log_info "Starting NGINX..."
+systemctl enable nginx > /dev/null 2>&1
+systemctl start nginx
+
+##############################################################################
+# 12. Verify Installation
+##############################################################################
+log_info "Verifying installation..."
+
+sleep 2
+
+if systemctl is-active --quiet nginx; then
+    log_info "✅ NGINX is running!"
+else
+    log_error "❌ NGINX failed to start"
+    systemctl status nginx
+    exit 1
+fi
+
+##############################################################################
+# 13. Display Summary
+##############################################################################
+echo ""
+echo "╔════════════════════════════════════════════════════════════════╗"
+echo "║          NGINX High-Performance Proxy - Installation Complete  ║"
+echo "╚════════════════════════════════════════════════════════════════╝"
+echo ""
+log_info "Configuration Summary:"
+echo "  • Domain/IP: $DOMAIN"
+echo "  • Email: $EMAIL"
+echo "  • HTTP Port: 80 (redirects to HTTPS)"
+echo "  • HTTPS Port: 443"
+if [ $CERT_FAILED -eq 1 ]; then
+echo "  • SSL Type: ⚠️  Self-Signed (browsers will show warnings)"
+else
+echo "  • SSL Type: ✅ Let's Encrypt (trusted)"
+fi
+echo "  • SSL Certificate: $SSL_CERT"
+echo "  • SSL Key: $SSL_KEY"
+echo "  • Config File: /etc/nginx/nginx.conf"
+echo "  • Error Log: /var/log/nginx/error.log"
+echo ""
+
+if [ $IS_IP -eq 1 ]; then
+    log_warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_warn "IP ADDRESS DETECTED - IMPORTANT NOTES:"
+    log_warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    log_warn "⚠️  Using SELF-SIGNED certificate"
+    log_warn "⚠️  Browsers will show 'Not Secure' warnings"
+    echo ""
+    log_tip "Solutions to get trusted SSL for IP $ORIGINAL_IP:"
+    echo ""
+    echo "  Option 1: Use free DNS services (EASIEST)"
+    echo "    • nip.io:    https://$ORIGINAL_IP.nip.io"
+    echo "    • sslip.io:  https://$ORIGINAL_IP.sslip.io"
+    echo "    Then rerun: sudo $0 $EMAIL $ORIGINAL_IP.nip.io"
+    echo ""
+    echo "  Option 2: Register a free domain"
+    echo "    • afraid.org, freenom.com, etc."
+    echo "    Point A record to $ORIGINAL_IP"
+    echo "    Then rerun: sudo $0 $EMAIL yourdomain.com"
+    echo ""
+    echo "  Option 3: Use Cloudflare Tunnel (recommended)"
+    echo "    • Free SSL certificate"
+    echo "    • DDoS protection included"
+    echo "    Install: curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb && sudo dpkg -i cloudflared.deb"
+    echo ""
+    echo "  Option 4: Accept self-signed (for testing only)"
+    echo "    In browser: Click 'Advanced' → 'Proceed to $DOMAIN (unsafe)'"
+    echo "    In code: Add { rejectUnauthorized: false } (NOT for production!)"
+    echo ""
+    log_warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+fi
+
+log_info "Usage Examples:"
+echo "  # Proxy to Binance API:"
+if [ $IS_IP -eq 1 ]; then
+echo "  curl -k https://$DOMAIN/https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+else
+echo "  curl https://$DOMAIN/https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+fi
+echo ""
+echo "  # From React/JavaScript:"
+echo "  fetch('https://$DOMAIN/https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT')"
+echo ""
+log_info "Management Commands:"
+echo "  • Test config:    nginx -t"
+echo "  • Reload:         systemctl reload nginx"
+echo "  • Restart:        systemctl restart nginx"
+echo "  • Status:         systemctl status nginx"
+echo "  • Logs:           tail -f /var/log/nginx/error.log"
+if [ $CERT_FAILED -eq 0 ]; then
+echo "  • Renew SSL:      certbot renew"
+fi
+echo ""
+log_info "Health Check:"
+if [ $IS_IP -eq 1 ]; then
+echo "  curl -k https://$DOMAIN/health"
+else
+echo "  curl https://$DOMAIN/health"
+fi
+echo ""
+if [ $CERT_FAILED -eq 0 ]; then
+log_info "SSL Certificate Auto-Renewal:"
+echo "  • Certbot will automatically renew certificates"
+echo "  • Test renewal: certbot renew --dry-run"
+echo "  • NGINX will auto-reload after renewal"
+echo ""
+fi
+echo "╔════════════════════════════════════════════════════════════════╗"
+if [ $CERT_FAILED -eq 1 ]; then
+echo "║  Installation complete with SELF-SIGNED SSL ⚠️                  ║"
+else
+echo "║  Installation successful! Your proxy is ready to use 🚀        ║"
+fi
+echo "╚════════════════════════════════════════════════════════════════╝"
+echo ""
